@@ -41,3 +41,7 @@ TEST_CASES.md
 .env.*.local
 
 .claude
+# Python backend
+backend/.venv/
+backend/__pycache__/
+backend/**/*.pyc
