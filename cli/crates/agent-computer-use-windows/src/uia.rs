@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use windows::core::BSTR;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::UI::Accessibility::*;
+use windows::Win32::Foundation::HWND;
 
 struct SendSyncCondition(IUIAutomationCondition);
 unsafe impl Send for SendSyncCondition {}
@@ -42,6 +43,15 @@ impl UiaContext {
             });
 
             Ok(Self { automation })
+        }
+    }
+    pub fn element_from_handle(&self, hwnd: HWND) -> Result<IUIAutomationElement> {
+        unsafe {
+            self.automation
+                .ElementFromHandle(hwnd)
+                .map_err(|e| Error::PlatformError {
+                    message: format!("failed to get UI element from window handle: {e}"),
+                })
         }
     }
 

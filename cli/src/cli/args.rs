@@ -434,7 +434,15 @@ pub enum Command {
 
     /// Get the currently focused element
     Focused,
+    /// Set keyboard focus to a UI element
+    Focus {
+        /// Selector DSL expression or @ref
+        selector: String,
 
+        /// Target application name
+        #[arg(short, long)]
+        app: Option<String>,
+    },
     /// Get all visible text from an app
     ///
     /// Traverses the full tree — use `get-value` for specific elements.

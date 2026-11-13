@@ -21,11 +21,13 @@ fn to_absolute(x: f64, y: f64) -> (i32, i32) {
     let (cx, cy) = screen_dimensions();
     let abs_x = ((x * 65535.0) / cx as f64) as i32;
     let abs_y = ((y * 65535.0) / cy as f64) as i32;
+
     (abs_x, abs_y)
 }
 
 pub fn move_mouse(point: Point) -> Result<()> {
     let (abs_x, abs_y) = to_absolute(point.x, point.y);
+
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -37,7 +39,12 @@ pub fn move_mouse(point: Point) -> Result<()> {
             },
         },
     };
-    send_inputs(&[input])
+
+    send_inputs(&[input])?;
+
+    std::thread::sleep(MOUSE_MOVE_DELAY);
+
+    Ok(())
 }
 
 pub fn click(point: Point, button: MouseButton, count: u32) -> Result<()> {

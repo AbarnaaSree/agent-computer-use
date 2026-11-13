@@ -410,7 +410,18 @@ pub async fn run(
                 data: None,
             });
         }
+        Command::Focus { selector, app } => {
+            let chain =
+                actions::parse_selector_with_app(&selector, app.as_deref())?;
 
+            let selector = chain.first().clone();
+
+            let result = platform
+                .perform(&Action::Focus { selector })
+                .await?;
+
+            output.print(&result);
+        }
         Command::Focused => {
             let node = platform.focused().await?;
             output.print(&node);

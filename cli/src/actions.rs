@@ -40,9 +40,7 @@ pub fn parse_selector_with_app(
 ) -> Result<SelectorChain, agent_computer_use_core::Error> {
     let mut chain = parse_selector(dsl)?;
     if let Some(a) = app {
-        if chain.selectors[0].app.is_none() {
-            chain.selectors[0].app = Some(a.to_string());
-        }
+        chain.selectors[0].app = Some(a.to_string());
     }
     Ok(chain)
 }
