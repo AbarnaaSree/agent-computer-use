@@ -1,3 +1,5 @@
+mod process_matching;
+
 #[cfg(target_os = "windows")]
 pub mod input;
 #[cfg(target_os = "windows")]

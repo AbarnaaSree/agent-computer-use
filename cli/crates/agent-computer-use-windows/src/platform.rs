@@ -1,6 +1,6 @@
 #[cfg(not(target_os = "windows"))]
 mod stub {
-    use agent_computer_use_core::action::{Action, ActionResult};
+    use agent_computer_use_core::action::{Action, ActionResult, MouseButton};
     use agent_computer_use_core::node::AccessibilityNode;
     use agent_computer_use_core::platform::{AppInfo, Platform, WindowInfo};
     use agent_computer_use_core::selector::Selector;
@@ -68,7 +68,7 @@ pub use stub::WindowsPlatform;
 
 #[cfg(target_os = "windows")]
 mod real {
-    use agent_computer_use_core::action::{Action, ActionResult};
+    use agent_computer_use_core::action::{Action, ActionResult, MouseButton};
     use agent_computer_use_core::node::{AccessibilityNode, Point};
     use agent_computer_use_core::platform::{AppInfo, Platform, WindowInfo};
     use agent_computer_use_core::selector::Selector;
@@ -79,7 +79,10 @@ mod real {
     use windows::Win32::Foundation::*;
     use windows::Win32::System::Threading::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
-
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
     use crate::input;
     use crate::uia::{self, UiaContext};
 
@@ -94,6 +97,12 @@ mod real {
 
     impl WindowsPlatform {
         pub fn new() -> Self {
+            unsafe {
+                let _dpi_result = SetProcessDpiAwarenessContext(
+                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                );
+            }
+
             INIT.get_or_init(|| unsafe {
                 let _ = windows::Win32::System::Com::CoInitializeEx(
                     None,
@@ -105,18 +114,16 @@ mod real {
             Self { uia }
         }
 
+
         fn find_app_pid(&self, app_name: &str) -> Result<u32> {
-            let app_lower = app_name.to_lowercase();
             let apps = self.list_processes()?;
-            for (pid, name) in &apps {
-                if name.to_lowercase().contains(&app_lower) {
-                    return Ok(*pid);
-                }
-            }
-            Err(Error::ApplicationNotFound {
-                name: app_name.to_string(),
-            })
+
+            crate::process_matching::find_process_id(app_name, &apps)
+                .ok_or_else(|| Error::ApplicationNotFound {
+                    name: app_name.to_string(),
+                })
         }
+
 
         fn list_processes(&self) -> Result<Vec<(u32, String)>> {
             use windows::Win32::System::ProcessStatus::*;
@@ -163,7 +170,17 @@ mod real {
             app: Option<&str>,
         ) -> Result<windows::Win32::UI::Accessibility::IUIAutomationElement> {
             match app {
-                Some(name) => self.uia.find_app_element(name),
+                Some(name) => {
+                    let pid = self.find_app_pid(name)?;
+
+                    let hwnd = find_window_for_pid(pid).ok_or_else(|| {
+                        Error::ApplicationNotFound {
+                            name: name.to_string(),
+                        }
+                    })?;
+
+                    self.uia.element_from_handle(hwnd)
+                }
                 None => self.uia.root(),
             }
         }
@@ -359,15 +376,63 @@ mod real {
                 }
 
                 Action::Focus { selector } => {
+                    if let Some(app) = selector.app.as_deref() {
+                        self.activate(app).await?;
+                    }
+
                     let root = self.get_app_root(selector.app.as_deref())?;
-                    if let Some(element) = uia::find_first(&root, selector) {
-                        unsafe {
-                            let _ = element.SetFocus();
+
+                    let element = uia::find_first(&root, selector)
+                        .ok_or_else(|| Error::PlatformError {
+                            message: "focus target element not found".into(),
+                        })?;
+
+                    unsafe {
+                        let _ = element.SetFocus();
+                        let target_pid = element.CurrentProcessId().ok();
+
+                        let mut has_focus = match (target_pid, self.uia.focused_element()) {
+                            (Some(target_pid), Ok(focused_element)) => {
+                                focused_element
+                                    .CurrentProcessId()
+                                    .map(|focused_pid| focused_pid == target_pid)
+                                    .unwrap_or(false)
+                            }
+                            _ => false,
+                        };
+
+                        if !has_focus {
+                            let node = uia::element_to_node(&element, Some(0), 0);
+
+                            let point = node.center().ok_or_else(|| Error::PlatformError {
+                                message: "focus target has no clickable position".into(),
+                            })?;
+
+                            input::click(point, MouseButton::Left, 1)?;
+
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+
+                            has_focus = match (target_pid, self.uia.focused_element()) {
+                                (Some(target_pid), Ok(focused_element)) => {
+                                    focused_element
+                                        .CurrentProcessId()
+                                        .map(|focused_pid| focused_pid == target_pid)
+                                        .unwrap_or(false)
+                                }
+                                _ => false,
+                            };
+                        }
+
+                        if !has_focus {
+                            return Err(Error::PlatformError {
+                                message: "keyboard focus could not be verified after clicking the target".into(),
+                            });
                         }
                     }
+
                     Ok(ActionResult {
                         success: true,
-                        message: Some("focused".into()),
+                        message: Some("element focused and verified successfully".into()),
                         path: None,
                         data: None,
                     })
@@ -481,10 +546,20 @@ mod real {
 
         async fn activate(&self, app: &str) -> Result<()> {
             let pid = self.find_app_pid(app)?;
-            let hwnd = find_window_for_pid(pid).ok_or_else(|| Error::PlatformError {
-                message: format!("no window found for '{app}'"),
-            })?;
-            force_foreground(hwnd);
+
+            let hwnd = find_window_for_pid(pid)
+                .or_else(|| find_window_by_title(app))
+                .ok_or_else(|| Error::PlatformError {
+                    message: format!("no window found for '{app}'"),
+                })?;
+
+            if !force_foreground(hwnd) {
+                return Err(Error::PlatformError {
+                    message: format!(
+                        "could not bring application '{app}' to the foreground"
+                    ),
+                });
+            }
             Ok(())
         }
 
@@ -592,48 +667,84 @@ mod real {
         find_window_for_pid(pid).is_some()
     }
 
-    fn force_foreground(hwnd: HWND) {
+
+
+
+    fn force_foreground(hwnd: HWND) -> bool {
         unsafe {
+            eprintln!(
+                "[WINDOW DEBUG] Selected HWND: {:?}, IsIconic: {}",
+                hwnd,
+                IsIconic(hwnd).as_bool()
+            );
+
             if IsIconic(hwnd).as_bool() {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
+            } else {
+                let _ = ShowWindow(hwnd, SW_SHOW);
             }
 
-            let foreground = GetForegroundWindow();
-            if foreground == hwnd {
-                return;
+            eprintln!(
+                "[WINDOW DEBUG] After restore: HWND: {:?}, IsIconic: {}",
+                hwnd,
+                IsIconic(hwnd).as_bool()
+            );
+
+            std::thread::sleep(std::time::Duration::from_millis(300));
+
+            if GetForegroundWindow() == hwnd {
+                return !IsIconic(hwnd).as_bool();
             }
 
             let current_thread = GetCurrentThreadId();
+            let target_thread = GetWindowThreadProcessId(hwnd, None);
+            let foreground = GetForegroundWindow();
+
             let foreground_thread = if foreground != HWND::default() {
                 GetWindowThreadProcessId(foreground, None)
             } else {
                 0
             };
 
-            let attached = foreground_thread != 0
+            let attached_target = target_thread != 0
+                && target_thread != current_thread
+                && AttachThreadInput(current_thread, target_thread, true).as_bool();
+
+            let attached_foreground = foreground_thread != 0
                 && foreground_thread != current_thread
+                && foreground_thread != target_thread
                 && AttachThreadInput(current_thread, foreground_thread, true).as_bool();
 
             let _ = BringWindowToTop(hwnd);
             let _ = SetForegroundWindow(hwnd);
-            let _ = ShowWindow(hwnd, SW_SHOW);
 
-            if attached {
+            if attached_foreground {
                 let _ = AttachThreadInput(current_thread, foreground_thread, false);
             }
+
+            if attached_target {
+                let _ = AttachThreadInput(current_thread, target_thread, false);
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(300));
+
+            GetForegroundWindow() == hwnd && !IsIconic(hwnd).as_bool()
         }
     }
 
+
+
+
     struct FindPidContext {
         target_pid: u32,
-        found: Option<HWND>,
+        windows: Vec<HWND>,
     }
 
     fn find_window_for_pid(pid: u32) -> Option<HWND> {
         unsafe {
             let mut ctx = FindPidContext {
                 target_pid: pid,
-                found: None,
+                windows: Vec::new(),
             };
 
             let _ = EnumWindows(
@@ -641,22 +752,38 @@ mod real {
                 LPARAM(&mut ctx as *mut FindPidContext as isize),
             );
 
-            ctx.found
+            // Prefer a non-minimized window.
+            ctx.windows
+                .iter()
+                .copied()
+                .find(|hwnd| !IsIconic(*hwnd).as_bool())
+                .or_else(|| ctx.windows.first().copied())
         }
     }
 
-    unsafe extern "system" fn find_pid_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    unsafe extern "system" fn find_pid_callback(
+        hwnd: HWND,
+        lparam: LPARAM,
+    ) -> BOOL {
         let ctx = &mut *(lparam.0 as *mut FindPidContext);
+
         let mut window_pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
 
-        if window_pid == ctx.target_pid && IsWindowVisible(hwnd).as_bool() {
-            let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-            if style & WS_EX_TOOLWINDOW.0 == 0 {
-                ctx.found = Some(hwnd);
-                return FALSE;
-            }
+        if window_pid != ctx.target_pid
+            || !IsWindowVisible(hwnd).as_bool()
+        {
+            return TRUE;
         }
+
+        let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+
+        if style & WS_EX_TOOLWINDOW.0 != 0 {
+            return TRUE;
+        }
+
+        ctx.windows.push(hwnd);
+
         TRUE
     }
 
@@ -703,13 +830,53 @@ mod real {
         TRUE
     }
 
+    struct FindTitleContext {
+        target_title: String,
+        found: Option<HWND>,
+    }
+
+    unsafe extern "system" fn find_title_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam.0 as *mut FindTitleContext);
+
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return TRUE;
+        }
+
+        let style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        if style & WS_EX_TOOLWINDOW.0 != 0 {
+            return TRUE;
+        }
+
+        let mut title_buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, &mut title_buf);
+
+        if len == 0 {
+            return TRUE;
+        }
+
+        let window_title = String::from_utf16_lossy(&title_buf[..len as usize]);
+
+        if window_title.eq_ignore_ascii_case(&ctx.target_title) {
+            ctx.found = Some(hwnd);
+            return FALSE;
+        }
+
+        TRUE
+    }
+
     fn find_window_by_title(title: &str) -> Option<HWND> {
         unsafe {
-            let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-            match FindWindowW(None, windows::core::PCWSTR(wide.as_ptr())) {
-                Ok(hwnd) if hwnd != HWND::default() => Some(hwnd),
-                _ => None,
-            }
+            let mut ctx = FindTitleContext {
+                target_title: title.to_string(),
+                found: None,
+            };
+
+            let _ = EnumWindows(
+                Some(find_title_callback),
+                LPARAM(&mut ctx as *mut FindTitleContext as isize),
+            );
+
+            ctx.found
         }
     }
 }
