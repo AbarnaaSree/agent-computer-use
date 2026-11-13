@@ -1,7 +1,7 @@
 [
   {
     "title": "Quick Start",
-    "content": "Quick Start Install and try it in 2 minutes agent-computer-use Computer use CLI for AI Agents. Windows agent-computer-use lets you control desktop apps from the terminal. Click buttons, type into\n        fields, read what&apos;s on screen. All using a single CLI. Star it on GitHub How it works agent-computer-use reads the accessibility tree — the same structure screen readers use. It\n        sees every button, text field, and menu item in any app. You point, it acts. Capture every interactive element. Each gets a ref. Use refs to click, type, or read. UI changed? Snapshot again for fresh refs. What can you do with it? Anything you&apos;d do by clicking around:",
+    "content": "Quick Start Install and try it in 2 minutes agent-computer-use Computer use CLI for AI Agents. Windows agent-computer-use lets you control desktop apps from the terminal. Click buttons, type into\r\n        fields, read what&apos;s on screen. All using a single CLI. Star it on GitHub How it works agent-computer-use reads the accessibility tree — the same structure screen readers use. It\r\n        sees every button, text field, and menu item in any app. You point, it acts. Capture every interactive element. Each gets a ref. Use refs to click, type, or read. UI changed? Snapshot again for fresh refs. What can you do with it? Anything you&apos;d do by clicking around:",
     "href": "/",
     "pageTitle": "Quick Start"
   },
@@ -307,7 +307,7 @@
   },
   {
     "title": "YAML Workflows",
-    "content": "title=\"YAML Workflows\" description=\"Define multi-step automations in YAML files.\" /> Workflows let you chain multiple agent-cu commands into a single replayable file.",
+    "content": "Workflows let you chain multiple agent-cu commands into a single replayable file.",
     "href": "/workflows#example-workflow",
     "pageTitle": "YAML Workflows"
   },
