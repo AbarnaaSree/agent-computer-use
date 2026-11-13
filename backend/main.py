@@ -1,0 +1,1963 @@
+
+import json
+import subprocess
+import re
+import os
+import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing import Literal
+
+# Load environment variables from backend/.env
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+app = FastAPI(
+    title="AI Desktop Automation",
+    description="OpenRouter-powered Windows desktop automation platform",
+    version="0.1.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+AGENT_CU = (
+    BASE_DIR.parent
+    / "cli"
+    / "target"
+    / "release"
+    / "agent-cu.exe"
+)
+
+
+def find_and_launch_app(app_name: str):
+    """Find and launch an application using Windows application metadata."""
+
+    def normalize(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+    requested_name = normalize(app_name.strip())
+
+    if not requested_name:
+        raise HTTPException(status_code=400, detail="Application name is required")
+
+    def is_app_running() -> bool:
+        script = r"""
+        @(
+            Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } |
+            ForEach-Object {
+                $path = $null
+                $product = $null
+                $description = $null
+
+                try { $path = $_.Path } catch {}
+
+                if ($path) {
+                    try {
+                        $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path)
+                        $product = $info.ProductName
+                        $description = $info.FileDescription
+                    } catch {}
+                }
+
+                [PSCustomObject]@{
+                    ProcessName = $_.ProcessName
+                    ProductName = $product
+                    FileDescription = $description
+                    ProcessId = $_.Id
+                }
+            }
+        ) | ConvertTo-Json -Compress
+        """
+
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=result.stderr.strip() or "Could not inspect running applications"
+            )
+
+        if not result.stdout.strip():
+            return False
+
+        processes = json.loads(result.stdout)
+
+        if isinstance(processes, dict):
+            processes = [processes]
+
+        for process in processes:
+            identities = (
+                process.get("ProcessName"),
+                process.get("ProductName"),
+                process.get("FileDescription")
+            )
+
+            if any(
+                normalize(identity) == requested_name
+                for identity in identities
+                if identity
+            ):
+                return True
+
+        return False
+
+    # Check whether the requested application is already running.
+    if is_app_running():
+        return
+
+    # Discover registered applications without application-specific aliases.
+    script = r"""
+    Get-StartApps |
+    Select-Object Name, AppID |
+    ConvertTo-Json -Compress
+    """
+
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False
+    )
+
+    if result.returncode != 0 or not result.stdout.strip():
+        raise HTTPException(
+            status_code=500,
+            detail=result.stderr.strip() or "Could not discover installed applications"
+        )
+
+    applications = json.loads(result.stdout)
+
+    if isinstance(applications, dict):
+        applications = [applications]
+
+    matches = [
+        item for item in applications
+        if item.get("Name")
+        and item.get("AppID")
+        and normalize(item["Name"]) == requested_name
+    ]
+
+    if not matches:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No registered application found matching: {app_name}"
+        )
+
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Multiple applications match: {app_name}"
+        )
+
+    app_id = matches[0]["AppID"]
+
+    # Launch the application.
+    subprocess.Popen(
+        ["explorer.exe", f"shell:AppsFolder\\{app_id}"],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
+
+    # Wait for the application to appear in running process metadata.
+    for _ in range(20):
+        time.sleep(0.5)
+
+        if is_app_running():
+            return
+
+    raise HTTPException(
+        status_code=504,
+        detail=f"{app_name} was launched but its process was not detected in time."
+    )
+
+
+def get_agent_app_name(app_name: str) -> str:
+    return app_name
+
+def run_agent_cu(arguments: list[str], timeout: int = 15):
+    if not AGENT_CU.is_file():
+        raise HTTPException(
+            status_code=500,
+            detail="agent-cu executable not found. Build the Rust project first."
+        )
+
+    try:
+        result = subprocess.run(
+            [str(AGENT_CU), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=result.stderr.strip() or "Rust CLI execution failed"
+            )
+
+        return result.stdout
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="Rust automation command timed out"
+        )
+
+
+def wait_for_ui_stability(
+    app_name: str,
+    previous_snapshot: str,
+    timeout: int = 20,
+    stable_checks: int = 3,
+    poll_interval: float = 0.5
+):
+    """Wait until the application UI changes and becomes stable."""
+
+    deadline = time.monotonic() + timeout
+    last_snapshot = None
+    consecutive_matches = 0
+    detected_change = False
+
+    while time.monotonic() < deadline:
+        current_snapshot = run_agent_cu(
+            ["snapshot", "--app", app_name, "-i", "-c"],
+            timeout=15
+        )
+
+        if current_snapshot and current_snapshot != previous_snapshot:
+            detected_change = True
+
+            if current_snapshot == last_snapshot:
+                consecutive_matches += 1
+            else:
+                last_snapshot = current_snapshot
+                consecutive_matches = 1
+
+            if consecutive_matches >= stable_checks:
+                return current_snapshot
+
+        time.sleep(poll_interval)
+
+    if not detected_change:
+        raise RuntimeError(
+            f"UI did not change in {app_name} after the action."
+        )
+
+    raise RuntimeError(
+        f"UI did not become stable in {app_name}."
+    )
+
+def get_openrouter_client():
+    api_key = os.getenv("OPENROUTER_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENROUTER_API_KEY is missing from backend/.env"
+        )
+
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        default_headers={
+            "HTTP-Referer": "http://localhost:5173",
+            "X-Title": "AI Desktop Automation"
+        }
+    )
+
+
+class PlanRequest(BaseModel):
+    task: str = Field(min_length=3, max_length=500)
+    app: str = Field(min_length=1, max_length=80)
+
+class ExecuteStep(BaseModel):
+    action: Literal["click", "type", "key"]
+    target_ref: str | None = None
+    value: str | None = None
+    reason: str | None = None
+
+
+class ExecuteRequest(BaseModel):
+    app: str = Field(min_length=1, max_length=80)
+    snapshot: str = Field(min_length=1)
+    steps: list[ExecuteStep] = Field(min_length=1, max_length=10)
+    confirmed: bool = False
+
+# Multi-application automation models
+
+class MultiAppPlanRequest(BaseModel):
+    task: str = Field(min_length=3, max_length=500)
+    apps: list[str] = Field(min_length=2, max_length=5)
+
+class MultiAppPrepareRequest(BaseModel):
+    task: str = Field(min_length=3, max_length=500)
+    apps: list[str] = Field(min_length=2, max_length=5)
+
+class MultiAppExecuteStep(BaseModel):
+    app: str = Field(min_length=1, max_length=80)
+    action: Literal["focus", "click", "type", "key"]
+    target_ref: str | None = None
+    value: str | None = None
+    reason: str | None = None
+
+
+class MultiAppExecuteRequest(BaseModel):
+    snapshots: dict[str, str]
+    steps: list[MultiAppExecuteStep] = Field(min_length=1, max_length=30)
+    confirmed: bool = False
+
+@app.get("/")
+async def root():
+    return {
+        "message": "AI Desktop Automation API",
+        "platform": "Windows",
+        "status": "running"
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "backend": "FastAPI"
+    }
+
+
+
+@app.get("/apps")
+async def get_running_apps():
+    output = run_agent_cu(["apps"], timeout=10)
+    windows_output = run_agent_cu(["windows"], timeout=10)
+
+    try:
+        applications = json.loads(output)
+        windows = json.loads(windows_output)
+
+        # Map packaged Windows application window titles.
+        app_names = {
+            item["name"]
+            for item in applications
+            if item.get("name")
+        }
+
+        for window in windows:
+            title = window.get("title", "").strip()
+            app_name = window.get("app", "").strip()
+
+            if title and app_name == "ApplicationFrameHost":
+                if title.lower() not in {"search bar", "windows input experience"}:
+                    app_names.add(title)
+
+        # Preserve existing app information.
+        result = []
+        for name in sorted(app_names, key=str.lower):
+            existing = next(
+                (item for item in applications if item.get("name") == name),
+                None
+            )
+
+            if existing:
+                result.append(existing)
+            else:
+                matching_window = next(
+                    (w for w in windows if w.get("title", "").strip() == name),
+                    {}
+                )
+                result.append({
+                    "name": name,
+                    "pid": matching_window.get("pid"),
+                    "frontmost": matching_window.get("frontmost", False)
+                })
+
+        return {
+            "success": True,
+            "count": len(result),
+            "applications": result
+        }
+
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=500,
+            detail="Invalid JSON received from Rust CLI"
+        )
+
+
+
+@app.get("/installed-apps")
+async def get_installed_apps():
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Depth 3"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=result.stderr.strip() or "Could not retrieve installed applications"
+            )
+
+        applications = json.loads(result.stdout)
+
+        # PowerShell returns an object instead of a list
+        # when only one application is found.
+        if isinstance(applications, dict):
+            applications = [applications]
+
+        applications = [
+            {
+                "name": item["Name"],
+                "app_id": item["AppID"]
+            }
+            for item in applications
+            if item.get("Name") and item.get("AppID")
+        ]
+
+        applications.sort(key=lambda item: item["name"].lower())
+
+        return {
+            "success": True,
+            "count": len(applications),
+            "applications": applications
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="Installed application discovery timed out"
+        )
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not parse installed application data"
+        )
+
+
+@app.get("/snapshot")
+def get_snapshot(app: str = Query(..., min_length=1, max_length=80)):
+    find_and_launch_app(app)
+
+    app_alias = app.strip().lower().replace("microsoft ", "")
+
+    for _ in range(15):
+        windows_output = run_agent_cu(["windows"], timeout=10)
+        windows = json.loads(windows_output)
+
+        if any(
+            (
+                app_alias in window.get("title", "").lower()
+                or app_alias in window.get("app", "").lower()
+            )
+            and not window.get("minimized", False)
+            for window in windows
+        ):
+            break
+
+        time.sleep(1)
+    else:
+        raise HTTPException(
+            status_code=408,
+            detail=f"{app} did not open within 15 seconds"
+        )
+
+    return run_agent_cu(["snapshot", "--app", app, "-i", "-c"])
+
+@app.post("/plan")
+async def create_plan(request: PlanRequest):
+    if not all(char.isalnum() or char in " ._-" for char in request.app):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid application name"
+        )
+
+    # Launch the application if it is not already open.
+    find_and_launch_app(request.app)
+
+    # Wait for the application window to become available.
+    app_name = request.app.strip().lower()
+    app_alias = app_name.replace("microsoft ", "")
+
+    for _ in range(15):
+        windows_output = run_agent_cu(["windows"], timeout=10)
+        windows = json.loads(windows_output)
+
+        if any(
+            (
+                app_alias in window.get("title", "").lower()
+                or app_alias in window.get("app", "").lower()
+            )
+            and not window.get("minimized", False)
+            for window in windows
+        ):
+            break
+
+        time.sleep(1)
+    else:
+        raise HTTPException(
+            status_code=408,
+            detail=f"{request.app} did not open within 15 seconds"
+        )
+
+    # Capture the application UI.
+    snapshot_output = run_agent_cu(
+        ["snapshot", "--app", request.app, "-i", "-c"],
+        timeout=15
+    )
+    # Limit planner context while preserving UI references.
+    planner_snapshot = snapshot_output[:12000]
+
+    # Extract actual element references from the snapshot.
+    valid_refs = set(re.findall(r"@e\d+", snapshot_output))
+
+    if not valid_refs:
+        raise HTTPException(
+            status_code=422,
+            detail="No interactive UI element references found in the snapshot"
+        )
+
+    model = os.getenv(
+        "OPENROUTER_MODEL",
+        "google/gemini-2.5-flash"
+    )
+
+    try:
+        client = get_openrouter_client()
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You are a Windows desktop automation planner.
+
+Analyze the user's task and the current UI snapshot.
+
+Return ONLY valid JSON using this exact structure:
+
+{
+  "task": "short task description",
+  "app": "application name",
+  "response": "helpful explanation for the user",
+  "steps": [
+    {
+      "action": "click",
+      "target_ref": "@e40",
+      "value": null,
+      "reason": "why this action is needed"
+    }
+  ],
+  "requires_confirmation": true
+}
+
+RULES:
+
+1. Use only exact element references visible in the supplied snapshot.
+2. Never invent or modify an element reference.
+3. Every click, type, and wait action MUST use an exact reference such as @e1, @e2, or @e3 copied from the supplied snapshot.
+4. NEVER use element names, descriptions, labels, or phrases as target_ref.
+5. If no suitable reference exists for an action, return an empty steps array and explain the limitation in response.
+6. Do not invent numbers, text, or values the user did not specify.
+7. If the user only asks to find, locate, identify, or explain a UI element,
+   provide the answer in "response" and return an empty steps array.
+8. Do not click an element merely to show where it is.
+9. If the requested task cannot be completed using the snapshot,
+   explain the limitation in "response" and return an empty steps array.
+10. Never generate shell commands or arbitrary code.
+11. Never execute actions. Only create a proposed plan.
+12. Keep the plan concise.
+13. Return ONLY valid JSON.
+14. Do not include explanations outside JSON.
+15. Keep the response field to one short sentence.
+16. Keep each step reason to 3-5 words.
+17. Do not repeat the UI snapshot in the response.
+18. Never include unnecessary fields.
+19. Always set "requires_confirmation" to true when the steps array contains one or more actions. Never set it to false for an action plan.
+
+20. Generate a complete action sequence that achieves the user's requested final outcome, not just the first interaction.
+
+21. Think through every necessary action before returning the plan.
+
+22. For browser searches:
+    - Click the browser address bar.
+    - Type the requested search query.
+    - Press Return using a key action with target_ref set to null.
+
+23. For website navigation:
+    - Click the address bar.
+    - Type the requested URL.
+    - Press Return using a key action with target_ref set to null.
+    - Add a wait action when necessary for the page to load.
+
+24. For form submissions, menus, dialogs, and other interactions, include the necessary final confirmation or submission action.
+
+25. A key action must use this structure:
+    {
+      "action": "key",
+      "target_ref": null,
+      "value": "Return",
+      "reason": "Submit the search"
+    }
+
+26. Use only supported keyboard keys:
+    Return, Enter, Escape, Tab, Backspace, Delete,
+    Space, Up, Down, Left, Right, Home, End, ctrl+a.
+
+27. Do not omit keyboard actions simply because typing was successful.
+
+28. Do not stop planning after focusing an element or entering text if the user's requested task requires another action.
+
+29. Do not add unnecessary actions. Every step must contribute to completing the requested task.
+
+30. If the complete task cannot be planned using the available UI references, clearly explain the limitation instead of presenting a partial plan as complete.
+
+"""
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Application: {request.app}\n"
+                        f"User task: {request.task}\n\n"
+                        f"Valid UI references: {sorted(valid_refs)}\n\n"
+                        f"Current UI snapshot:\n{planner_snapshot}"
+                    )
+                }
+            ],
+            temperature=0.2,
+            max_tokens=8000,
+            response_format={"type": "json_object"}
+        )
+
+        content = response.choices[0].message.content
+        print("MULTI-APP MODEL:", response.model)
+        print("FINISH REASON:", response.choices[0].finish_reason)
+        print("TOKEN USAGE:", response.usage)
+        print("AI RESPONSE:", content)
+        finish_reason = response.choices[0].finish_reason
+
+        if finish_reason == "length":
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"AI response truncated. "
+                    f"Requested model: {model}, "
+                    f"Actual model: {response.model}, "
+                    f"Finish reason: {finish_reason}, "
+                    f"Usage: {response.usage}"
+                )
+            )
+
+        if not content:
+            raise HTTPException(
+                status_code=502,
+                detail="OpenRouter returned an empty response"
+            )
+
+        cleaned = content.strip()
+
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3].strip()
+
+        plan = json.loads(cleaned)
+
+        if not isinstance(plan, dict):
+            raise ValueError("AI response must be a JSON object")
+
+        if not isinstance(plan.get("steps"), list):
+            raise ValueError("Plan steps must be a list")
+
+        if not isinstance(plan.get("response"), str):
+            raise ValueError("Plan response must be text")
+
+        if len(plan["steps"]) > 10:
+            raise ValueError("Plan contains too many steps")
+        
+        if plan["steps"]:
+            plan["requires_confirmation"] = True
+        else:
+            plan["requires_confirmation"] = False
+
+        allowed_actions = {"click", "type", "key", "wait"}
+        reference_required = {"click", "type", "wait"}
+
+        allowed_keys = {
+            "Return", "Enter", "Escape", "Tab",
+            "Backspace", "Delete", "Space",
+            "Up", "Down", "Left", "Right",
+            "Home", "End", "ctrl+a", "ctrl+c", "ctrl+v" , "ctrl+n"
+        }
+
+        for index, step in enumerate(plan["steps"], start=1):
+            if not isinstance(step, dict):
+                raise ValueError(f"Step {index} must be a JSON object")
+
+            action = step.get("action")
+            target_ref = step.get("target_ref")
+            value = step.get("value")
+
+            if action not in allowed_actions:
+                raise ValueError(
+                    f"Unsupported action in step {index}: {action}"
+                )
+
+            if action in reference_required:
+                if not isinstance(target_ref, str) or target_ref not in valid_refs:
+                    raise ValueError(
+                        f"Step {index} ({action}) requires a valid UI reference. "
+                        f"Received: {target_ref}"
+                    )
+            elif target_ref is not None:
+                raise ValueError(
+                    f"Step {index}: key action must have target_ref set to null"
+                )
+
+            if action == "type":
+                if not isinstance(value, str) or not value or len(value) > 1000:
+                    raise ValueError(
+                        f"Step {index}: type action requires text between 1 and 1000 characters"
+                    )
+
+            elif action == "key":
+                if value not in allowed_keys:
+                    raise ValueError(
+                        f"Step {index}: unsupported or missing keyboard key"
+                    )
+
+            elif action in {"click", "wait"}:
+                if value is not None:
+                    raise ValueError(
+                        f"Step {index}: {action} action must have value set to null"
+                    )
+
+
+        plan["app"] = request.app
+
+        return {
+            "success": True,
+            "model": model,
+            "valid_ui_references": sorted(valid_refs),
+            "snapshot": snapshot_output,
+            "plan": plan,
+            "execution_status": "not_executed"
+        }
+
+    except HTTPException:
+        raise
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=502,
+            detail="AI returned invalid JSON"
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Invalid AI plan: {str(error)}"
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenRouter request failed: {str(error)}"
+        )
+@app.post("/plan-multi")
+async def create_multi_app_plan(request: MultiAppPlanRequest):
+
+    # Validate selected applications
+    apps = list(dict.fromkeys(app.strip() for app in request.apps))
+
+    if len(apps) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least two different applications"
+        )
+
+    if any(
+        not app or not all(char.isalnum() or char in " ._-" for char in app)
+        for app in apps
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid application name"
+        )
+
+    snapshots = {}
+    valid_refs = {}
+
+    # Launch and capture each application's UI
+    for app_name in apps:
+        find_and_launch_app(app_name)
+
+        app_alias = app_name.strip().lower()
+
+        for _ in range(15):
+            windows_output = run_agent_cu(["windows"], timeout=10)
+            windows = json.loads(windows_output)
+
+            if any(
+                app_alias in window.get("title", "").lower()
+                or app_alias in window.get("app", "").lower()
+                for window in windows
+            ):
+                break
+
+            time.sleep(1)
+        else:
+            raise HTTPException(
+                status_code=408,
+                detail=f"{app_name} did not open within 15 seconds"
+            )
+
+        snapshot = run_agent_cu(
+            ["snapshot", "--app", app_name, "-i", "-c"],
+            timeout=15
+        )
+
+        refs = set(re.findall(r"@e\d+", snapshot))
+
+        if not refs:
+            raise HTTPException(
+                status_code=422,
+                detail=f"No interactive UI references found in {app_name}"
+            )
+
+        snapshots[app_name] = snapshot
+        valid_refs[app_name] = refs
+
+    model = os.getenv(
+        "OPENROUTER_MODEL",
+        "google/gemini-2.5-flash"
+    )
+
+    try:
+        client = get_openrouter_client()
+
+        ui_context = "\n\n".join(
+            f"APPLICATION: {name}\n"
+            f"VALID REFERENCES: {sorted(valid_refs[name])}\n"
+            f"UI SNAPSHOT:\n{snapshots[name][:12000]}"
+            for name in apps
+        )
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You are a Windows multi-application automation planner.
+
+Create one sequential plan that can use multiple selected applications.
+
+Return ONLY valid JSON:
+
+{
+  "task": "short task description",
+  "response": "short explanation",
+  "steps": [
+    {
+      "app": "Google Chrome",
+      "action": "click",
+      "target_ref": "@e1",
+      "value": null,
+      "reason": "Select address bar"
+    }
+  ],
+  "requires_confirmation": true
+}
+
+RULES:
+1. Use only the supplied applications.
+2. Every step must specify its application.
+3. Use only exact references from that application's snapshot.
+4. Focus, click and type actions require a valid target_ref.
+5. Key actions must use target_ref null.
+6. Supported actions: focus, click, type, key.
+   The action field must be exactly "key" for keyboard actions.
+   Never use a key name such as "Return" as the action.
+   For keyboard actions, put the key name in the value field.
+   Example: {"action":"key","target_ref":null,"value":"Return"}
+7. Supported keys: Return, Enter, Escape, Tab, Backspace,
+   Delete, Space, Up, Down, Left, Right, Home, End,
+   ctrl+a, ctrl+c, ctrl+v, ctrl+n.
+   For every key action, the value field MUST contain one exact supported key.
+   Never return null for a key action.
+   Use "Return" when submitting a search or pressing Enter.
+   7A. IMPORTANT:
+- Use "type" for all text, search queries, sentences and messages.
+- A type action MUST include a valid target_ref from the application's snapshot.
+- Use "key" ONLY for individual keyboard keys or supported shortcuts.
+- Never put ordinary text inside a key action.
+- Example:
+  {"action":"type","target_ref":"@e16","value":"Python tutorials"}
+  {"action":"key","target_ref":null,"value":"Return"}
+- Never use "key" with target_ref null to type text.
+8. Plan actions in the correct execution order.
+9. Include necessary actions to complete the entire task.
+10. Never invent UI references or application names.
+11. Do not generate shell commands or arbitrary code.
+12. If the task cannot be completed with the available UI,
+    return empty steps and explain why.
+13. Maximum 30 steps.
+14. Always require confirmation when steps exist.
+15. Return ONLY valid JSON.
+16. The applications are already launched. Do not plan to launch them.
+17. Use the supplied UI references directly.
+
+18. Identify UI elements by their roles, names, and available references in the supplied snapshots. Do not assume application-specific UI structures.
+
+19. For navigation or search tasks, identify the appropriate visible input field dynamically, focus it, enter the requested query or destination, and submit it using the appropriate action.
+
+20. For text-entry tasks, identify the appropriate editable element from the current application's UI snapshot. Never assume a particular editor type.
+
+21. Create steps for every requested application in the correct execution order. Do not return a partial plan when multiple applications are required.
+
+22. If the required controls are present in the snapshots, generate the corresponding actions.
+
+23. Use focus before typing, copying, or pasting whenever keyboard focus is not established.
+
+24. Focus the exact UI element identified by its supplied reference. Never invent references.
+
+25. After switching applications, establish focus on the intended target before sending keyboard input.
+
+26. Do not assume that activating an application automatically focuses the intended control.
+
+27. Before copying, identify the source content and establish the appropriate interaction context.
+
+28. Select and copy the requested content using appropriate keyboard shortcuts or available UI actions.
+
+29. When the user requests complete content, ensure the intended content is selected before copying. Use separate selection and copy actions where applicable.
+
+30. Before pasting, inspect the destination application's current UI state.
+
+31. If the destination contains existing user content, identify a safe way to create a new blank editing area before pasting.
+
+32. Never overwrite or append to existing user content unless explicitly requested.
+
+33. Do not assume an action succeeded merely because a keyboard command was issued.
+
+34. Verify that the requested content reached the intended destination.
+
+35. After creating a new document, tab, or editing area, identify its active editable element from a fresh UI snapshot and focus it before typing or pasting.
+
+36. If the UI does not expose enough information to perform an action safely, stop and explain the limitation rather than guessing.
+
+"""
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User task: {request.task}\n\n"
+                        f"Selected applications: {apps}\n\n"
+                        f"{ui_context}"
+                    )
+                }
+            ],
+            temperature=0.2,
+            max_tokens=8000,
+            extra_body={
+                "reasoning": {
+                    "max_tokens": 1500
+                }
+            },
+            response_format={"type": "json_object"}
+        )
+
+        content = response.choices[0].message.content
+        
+
+        print("MULTI-APP MODEL:", response.model)
+        print("FINISH REASON:", response.choices[0].finish_reason)
+        print("TOKEN USAGE:", response.usage)
+        print("AI RESPONSE:", content)
+
+        if response.choices[0].finish_reason == "length":
+            raise HTTPException(
+                status_code=502,
+                detail="Multi-app AI plan was truncated"
+            )
+
+        plan = json.loads(content)
+
+        if not isinstance(plan, dict) or not isinstance(plan.get("steps"), list):
+            raise ValueError("Invalid multi-app plan structure")
+
+        if len(plan["steps"]) > 30:
+            raise ValueError("Plan contains more than 30 steps")
+
+        for index, step in enumerate(plan["steps"], start=1):
+            if not isinstance(step, dict):
+                raise ValueError(f"Step {index} must be an object")
+
+            app_name = step.get("app")
+            action = step.get("action")
+            target_ref = step.get("target_ref")
+            value = step.get("value")
+
+            if app_name not in apps:
+                raise ValueError(f"Unknown application in step {index}")
+
+            if action not in {"focus", "click", "type", "key"}:
+                raise ValueError(f"Unsupported action in step {index}")
+
+            if action in {"focus", "click", "type"}:
+                if target_ref not in valid_refs[app_name]:
+                    raise ValueError(f"Invalid reference in step {index}")
+
+            elif action == "key":
+                step["target_ref"] = None
+
+            if action == "type":
+                if not isinstance(value, str) or not value or len(value) > 1000:
+                    raise ValueError(f"Invalid text in step {index}")
+
+            elif action == "key":
+                if value not in {
+                    "Return", "Enter", "Escape", "Tab", "Backspace",
+                    "Delete", "Space", "Up", "Down", "Left", "Right",
+                    "Home", "End", "ctrl+a" , "ctrl+c", "ctrl+v", "ctrl+n"
+                }:
+                    raise ValueError(f"Unsupported key in step {index}")
+
+            elif action in {"focus", "click"} and value is not None:
+                raise ValueError(f"Unexpected value in step {index}")
+
+        # Protect existing document content from accidental modification.
+        for index, step in enumerate(plan["steps"]):
+            if step.get("action") != "type":
+                continue
+
+            app_name = step["app"]
+            target_ref = step.get("target_ref")
+
+            # Find the target element in the original UI snapshot.
+            element_line = next(
+                (
+                    line for line in snapshots[app_name].splitlines()
+                    if f"[{target_ref}]" in line
+                ),
+                ""
+            )
+
+            # Check whether the target is a non-empty text editor.
+            is_existing_editor = (
+                "textarea" in element_line.lower()
+                and re.search(r'\bval="[^"]+?"', element_line) is not None
+            )
+
+            if is_existing_editor:
+                has_new_document = any(
+                    previous.get("app") == app_name
+                    and previous.get("action") == "key"
+                    and previous.get("value") == "ctrl+n"
+                    for previous in plan["steps"][:index]
+                )
+
+                if not has_new_document:
+                    raise ValueError(
+                        f"Unsafe typing blocked in {app_name}: "
+                        "the target editor already contains content. "
+                        "Create a new document with Ctrl+N first."
+                    )
+        plan["requires_confirmation"] = bool(plan["steps"])
+
+        return {
+            "success": True,
+            "model": response.model,
+            "apps": apps,
+            "snapshots": snapshots,
+            "plan": plan,
+            "execution_status": "not_executed"
+        }
+
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, ValueError) as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Invalid multi-app AI plan: {str(error)}"
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenRouter request failed: {str(error)}"
+        )
+
+@app.post("/prepare-multi")
+async def prepare_multi_app(request: MultiAppPrepareRequest):
+
+    apps = list(dict.fromkeys(
+        app.strip() for app in request.apps
+    ))
+
+    if len(apps) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Select at least two different applications"
+        )
+
+    if any(
+        not app or not all(
+            char.isalnum() or char in " ._-"
+            for char in app
+        )
+        for app in apps
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid application name"
+        )
+
+    snapshots = {}
+    valid_refs = {}
+
+    # Capture the current UI of every selected application.
+    for app_name in apps:
+        find_and_launch_app(app_name)
+
+        snapshot = run_agent_cu(
+            ["snapshot", "--app", app_name, "-i", "-c"],
+            timeout=15
+        )
+
+        refs = set(re.findall(r"@e\d+", snapshot))
+
+        if not refs:
+            raise HTTPException(
+                status_code=422,
+                detail=f"No interactive UI references found in {app_name}"
+            )
+
+        snapshots[app_name] = snapshot
+        valid_refs[app_name] = refs
+
+    model = os.getenv(
+        "OPENROUTER_MODEL",
+        "google/gemini-2.5-flash"
+    )
+
+    try:
+        client = get_openrouter_client()
+
+        ui_context = "\n\n".join(
+            f"APPLICATION: {name}\n"
+            f"VALID REFERENCES: {sorted(valid_refs[name])}\n"
+            f"UI SNAPSHOT:\n{snapshots[name][:6000]}"
+            for name in apps
+        )
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You are a dynamic Windows application preparation planner.
+
+Prepare the selected applications for the user's requested task.
+
+Return ONLY valid JSON:
+
+{
+  "task": "preparation description",
+  "response": "what will be prepared",
+  "steps": [
+    {
+      "app": "application name",
+      "action": "click",
+      "target_ref": "@e1",
+      "value": null,
+      "reason": "Open the required document"
+    }
+  ],
+  "requires_confirmation": true
+}
+
+RULES:
+1. Use only supplied applications and exact UI references.
+2. Never hardcode application names, file paths, document names,
+   UI labels, or element references.
+3. Infer the required source and destination applications
+   from the user's task and supplied snapshots.
+4. Inspect the current UI to determine what is already open.
+5. If the required source document is not open, use available
+   UI controls to locate and open the document identified
+   by the user's task.
+6. Prepare the destination application for the requested task.
+7. Do not perform the actual copy, paste, or final task yet.
+8. Do not overwrite existing user content.
+9. If a safe preparation action cannot be identified,
+   return empty steps and explain why.
+10. Supported actions: focus, click, type, key.
+11. Focus, click and type require valid target_ref values.
+12. Key actions require target_ref null.
+13. Supported keys: Return, Enter, Escape, Tab, Backspace,
+    Delete, Space, Up, Down, Left, Right, Home, End,
+    ctrl+a, ctrl+c, ctrl+v, ctrl+n.
+14. Use type for text and key only for keyboard shortcuts.
+15. Maximum 30 steps.
+16. Return valid JSON only.
+"""
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User task: {request.task}\n\n"
+                        f"Selected applications: {apps}\n\n"
+                        f"{ui_context}"
+                    )
+                }
+            ],
+            temperature=0.2,
+            max_tokens=5000,
+            response_format={"type": "json_object"}
+        )
+
+        if response.choices[0].finish_reason == "length":
+            raise HTTPException(
+                status_code=502,
+                detail="Preparation plan was truncated"
+            )
+
+        plan = json.loads(
+            response.choices[0].message.content
+        )
+
+        if not isinstance(plan, dict) or not isinstance(
+            plan.get("steps"), list
+        ):
+            raise ValueError("Invalid preparation plan")
+
+        if len(plan["steps"]) > 30:
+            raise ValueError("Too many preparation steps")
+
+        for index, step in enumerate(plan["steps"], start=1):
+            if not isinstance(step, dict):
+                raise ValueError(f"Invalid step {index}")
+
+            app_name = step.get("app")
+            action = step.get("action")
+            target_ref = step.get("target_ref")
+            value = step.get("value")
+
+            if app_name not in apps:
+                raise ValueError(f"Unknown application in step {index}")
+
+            if action not in {"focus", "click", "type", "key"}:
+                raise ValueError(f"Invalid action in step {index}")
+
+            if action in {"focus", "click", "type"}:
+                if target_ref not in valid_refs[app_name]:
+                    raise ValueError(f"Invalid reference in step {index}")
+
+            if action == "key":
+                step["target_ref"] = None
+                if value not in {
+                    "Return", "Enter", "Escape", "Tab",
+                    "Backspace", "Delete", "Space",
+                    "Up", "Down", "Left", "Right",
+                    "Home", "End", "ctrl+a", "ctrl+c",
+                    "ctrl+v", "ctrl+n"
+                }:
+                    raise ValueError(f"Invalid key in step {index}")
+
+            if action == "type":
+                if not isinstance(value, str) or not value or len(value) > 1000:
+                    raise ValueError(f"Invalid text in step {index}")
+
+            if action in {"focus", "click"} and value is not None:
+                raise ValueError(f"Unexpected value in step {index}")
+
+        plan["requires_confirmation"] = bool(plan["steps"])
+
+        return {
+            "success": True,
+            "model": response.model,
+            "apps": apps,
+            "snapshots": snapshots,
+            "plan": plan,
+            "execution_status": "not_executed"
+        }
+
+    except HTTPException:
+        raise
+    except (json.JSONDecodeError, ValueError) as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Invalid preparation plan: {str(error)}"
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Preparation planning failed: {str(error)}"
+        )
+
+@app.post("/execute")
+async def execute_plan(request: ExecuteRequest):
+    # Validate application name.
+    if not all(char.isalnum() or char in " ._-" for char in request.app):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid application name"
+        )
+
+    # Require explicit user approval.
+    if request.confirmed is not True:
+        raise HTTPException(
+            status_code=403,
+            detail="User confirmation is required before execution"
+        )
+
+    # Capture a fresh snapshot and reject stale plans.
+    fresh_snapshot = run_agent_cu(
+        ["snapshot", "--app", request.app, "-i", "-c"],
+        timeout=15
+    )
+
+    if not request.snapshot or not fresh_snapshot:
+        raise HTTPException(
+            status_code=409,
+            detail="Unable to validate the application UI. Generate a new plan."
+        )
+
+    planned_refs = set(re.findall(r"@e\d+", request.snapshot))
+    fresh_refs = set(re.findall(r"@e\d+", fresh_snapshot))
+    print("PLANNED REFS:", planned_refs)
+    print("FRESH REFS:", fresh_refs)
+    print("MISSING REFS:", planned_refs - fresh_refs)
+    if not planned_refs or not planned_refs.issubset(fresh_refs):
+        raise HTTPException(
+            status_code=409,
+            detail="The planned UI elements have changed. Generate a new plan."
+        )
+
+    valid_refs = set(re.findall(r"@e\d+", fresh_snapshot))
+
+    # Conservative keyboard allowlist.
+    allowed_keys = {
+        "Return", "Enter", "Escape", "Tab",
+        "Backspace", "Delete", "Space",
+        "Up", "Down", "Left", "Right",
+        "Home", "End", "ctrl+a","ctrl+c", "ctrl+v", "ctrl+n"
+    }
+
+    results = []
+    agent_app = get_agent_app_name(request.app)
+    print("ORIGINAL APP:", request.app)
+    print("MAPPED APP:", agent_app)
+    for index, step in enumerate(request.steps, start=1):
+        action = step.action
+        target_ref = step.target_ref
+        value = step.value
+
+        # Validate references.
+        if action in {"click", "type", "wait"}:
+            if target_ref not in valid_refs:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid UI reference in step {index}: {target_ref}"
+                )
+        elif target_ref is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Key action must not have a target reference (step {index})"
+            )
+        if action == "focus":
+            if value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Focus action cannot contain a value (step {index})"
+                )
+
+            arguments = [
+                "focus", target_ref,
+                "--app", agent_app
+            ]
+
+        elif action == "click":
+        # Construct arguments without invoking a shell.
+            if value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Click action cannot contain a value (step {index})"
+                )
+
+            arguments = [
+                "click", target_ref,
+                "--app", agent_app
+            ]
+
+        elif action == "type":
+            if not isinstance(value, str) or not value or len(value) > 1000:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid text value in step {index}"
+                )
+
+            arguments = [
+                "type", value,
+                "--selector", target_ref,
+                "--app", agent_app
+            ]
+
+        elif action == "key":
+            if value not in allowed_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Keyboard key is not allowed in step {index}"
+                )
+
+            arguments = [
+                "key", value,
+                "--app", agent_app
+            ]
+
+        elif action == "wait":
+            if value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Wait action cannot contain a value (step {index})"
+                )
+
+            arguments = [
+                "wait-for", target_ref,
+                "--timeout", "5"
+            ]
+
+        try:
+            output = run_agent_cu(arguments, timeout=15)
+            print("RUST ACTION OUTPUT:", output)
+            try:
+                action_result = json.loads(output)
+            except json.JSONDecodeError:
+                action_result = {"output": output}
+
+            results.append({
+                "step": index,
+                "action": action,
+                "success": True,
+                "result": action_result
+            })
+
+        except HTTPException as error:
+            return {
+                "success": False,
+                "failed_step": index,
+                "completed_steps": results,
+                "detail": error.detail,
+                "execution_status": "stopped"
+            }
+
+    # Capture final application state.
+    final_snapshot = run_agent_cu(
+        ["snapshot", "--app", request.app, "-i", "-c"],
+        timeout=15
+    )
+
+    return {
+        "success": True,
+        "application": request.app,
+        "completed_steps": len(results),
+        "results": results,
+        "final_snapshot": final_snapshot,
+        "execution_status": "completed"
+    }
+
+def get_fresh_app_snapshot(app_name: str):
+    """Capture the current UI state of an application."""
+    return run_agent_cu(
+        ["snapshot", "--app", app_name, "-i", "-c"],
+        timeout=15
+    )
+    
+
+
+@app.post("/execute-multi")
+async def execute_multi_plan(request: MultiAppExecuteRequest):
+
+    # Require explicit user approval.
+    if request.confirmed is not True:
+        raise HTTPException(
+            status_code=403,
+            detail="User confirmation is required before execution"
+        )
+
+    # Validate snapshots.
+    if not request.snapshots or len(request.snapshots) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Snapshots for at least two applications are required"
+        )
+
+    allowed_keys = {
+        "Return", "Enter", "Escape", "Tab",
+        "Backspace", "Delete", "Space",
+        "Up", "Down", "Left", "Right",
+        "Home", "End", "ctrl+a","ctrl+c", "ctrl+v", "ctrl+n"
+        }
+
+    # Validate application names.
+    for app_name in request.snapshots:
+        if not all(char.isalnum() or char in " ._-" for char in app_name):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid application name: {app_name}"
+            )
+
+    results = []
+    current_app = None
+    current_snapshot = None
+    valid_refs = set()
+    ref_remap = {}
+
+    # Execute actions in the requested sequence.
+    for index, step in enumerate(request.steps, start=1):
+
+        app_name = step.app
+        action = step.action
+        target_ref = step.target_ref
+        value = step.value
+
+        # Use updated UI references when an application creates a new document.
+        if target_ref is not None:
+            target_ref = ref_remap.get(
+                (app_name, target_ref),
+                target_ref
+            )
+
+        # Ensure the application has a planned snapshot.
+        if app_name not in request.snapshots:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown application in step {index}: {app_name}"
+            )
+
+        agent_app = get_agent_app_name(app_name)
+
+        # Refresh references whenever the application changes.
+        if current_app != app_name:
+
+            try:
+                fresh_snapshot = run_agent_cu(
+                    ["snapshot", "--app", app_name, "-i", "-c"],
+                    timeout=15
+                )
+
+            except HTTPException as exc:
+                return {
+                    "success": False,
+                    "failed_step": index,
+                    "completed_steps": results,
+                    "error": str(exc.detail),
+                    "execution_status": "stopped"
+                }
+
+            planned_refs = set(
+                re.findall(r"@e\d+", request.snapshots[app_name])
+            )
+
+            fresh_refs = set(
+                re.findall(r"@e\d+", fresh_snapshot)
+            )
+
+            if not planned_refs or not fresh_refs:
+                return {
+                    "success": False,
+                    "failed_step": index,
+                    "completed_steps": results,
+                    "error": f"Could not identify UI elements in {app_name}.",
+                    "execution_status": "stopped"
+                }
+
+            valid_refs = fresh_refs
+            current_app = app_name
+            current_snapshot = fresh_snapshot
+
+        # Validate action references.
+        if action in {"focus", "click", "type"}:
+
+            if target_ref not in valid_refs:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid UI reference in step {index}: {target_ref}"
+                )
+
+        elif target_ref is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Key action must not have a target reference (step {index})"
+            )
+        if action == "focus":
+
+            if value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Focus action cannot contain a value (step {index})"
+                )
+
+            arguments = [
+                "focus", target_ref,
+                "--app", agent_app
+            ]
+
+        elif action == "click":
+
+            if value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Click action cannot contain a value (step {index})"
+                )
+
+            arguments = [
+                "click", target_ref,
+                "--app", agent_app
+            ]
+
+        elif action == "type":
+
+            if not isinstance(value, str) or not value or len(value) > 1000:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid text value in step {index}"
+                )
+
+            arguments = [
+                "type", value,
+                "--selector", target_ref,
+                "--app", agent_app
+            ]
+
+        elif action == "key":
+
+            if value not in allowed_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported key in step {index}: {value}"
+                )
+
+            arguments = [
+                "key", value,
+                "--app", agent_app
+            ]
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported action in step {index}: {action}"
+            )
+        
+        # Focus and verify the actual Word document editor before CTRL+A.
+        if action == "key" and value == "ctrl+a":
+            if not current_snapshot:
+                raise RuntimeError(
+                    "Cannot select content: Word snapshot is unavailable."
+                )
+
+            
+            lines = current_snapshot.splitlines()
+
+            document_editors = []
+
+            for i, line in enumerate(lines):
+                match = re.match(
+                    r'^(\s*)\[@(e\d+)\]\s+textarea\b',
+                    line,
+                    re.IGNORECASE
+                )
+
+                if not match:
+                    continue
+
+                parent_indent = len(match.group(1))
+                has_nested_textfield = False
+
+                for child_line in lines[i + 1:]:
+                    if not child_line.strip():
+                        continue
+
+                    child_indent = len(child_line) - len(child_line.lstrip())
+
+                    if child_indent <= parent_indent:
+                        break
+
+                    if re.search(
+                        r'\[@e\d+\]\s+textfield\b',
+                        child_line,
+                        re.IGNORECASE
+                    ):
+                        has_nested_textfield = True
+                        break
+
+                if has_nested_textfield:
+                    document_editors.append(match.group(2))
+
+            print("WORD DOCUMENT EDITOR REFS:", document_editors)
+            print("========== CURRENT WORD SNAPSHOT ==========")
+            print(current_snapshot)
+
+            if len(document_editors) != 1:
+                raise RuntimeError(
+                    "Expected exactly one Word document editor, "
+                    f"but found {len(document_editors)}. "
+                    "CTRL+A and copying were stopped."
+                )
+
+            editor_ref = document_editors[0]
+
+
+            focus_output = run_agent_cu(
+                ["focus", f"@{editor_ref}", "--app", agent_app],
+                timeout=15
+            )
+
+            focus_result = json.loads(focus_output)
+            print("WORD DOCUMENT EDITOR REFS:", document_editors)
+            print("WORD FOCUS OUTPUT:", focus_output)
+            print("WORD SNAPSHOT CONTAINS DOCUMENT:",
+                "AGENT COMUPTER USE.docx" in current_snapshot)
+
+            if focus_result.get("success") is not True:
+                raise RuntimeError(
+                    "Could not focus the Word document editor. "
+                    "Copying was stopped."
+                )
+
+        # Execute the action.
+        try:
+            output = run_agent_cu(arguments, timeout=15)
+            if action == "key" and value == "ctrl+c":
+                print("CLIPBOARD COPY COMMAND OUTPUT:", output)
+                print("WORD SNAPSHOT AT COPY:", current_snapshot[:3000])
+            import tkinter as tk
+
+            try:
+                root = tk.Tk()
+                root.withdraw()
+                clipboard_text = root.clipboard_get()
+                root.destroy()
+
+                print("CLIPBOARD TEXT LENGTH:", len(clipboard_text))
+                print("CLIPBOARD PREVIEW:", repr(clipboard_text[:300]))
+            except Exception as error:
+                print("CLIPBOARD READ ERROR:", repr(error))
+            # Check the Rust CLI's actual result.
+            try:
+                parsed_output = json.loads(output)
+
+                if (
+                    isinstance(parsed_output, dict)
+                    and (
+                        parsed_output.get("error") is True
+                        or parsed_output.get("success") is False
+                    )
+                ):
+                    raise RuntimeError(
+                        parsed_output.get("message", "Rust action failed")
+                    )
+
+            except json.JSONDecodeError:
+                parsed_output = None
+
+            results.append({
+                "step": index,
+                "app": app_name,
+                "action": action,
+                "success": True,
+                "output": output
+            })
+            
+            # Wait for navigation after clicking a navigation-type UI element.
+            if action == "click" and current_snapshot:
+
+                target_line = next(
+                    (
+                        line for line in current_snapshot.splitlines()
+                        if re.search(
+                            rf"\[@{re.escape(target_ref)}\]",
+                            line
+                        )
+                    ),
+                    ""
+                )
+
+                role_match = re.search(
+                    r"\]\s+([a-zA-Z]+)",
+                    target_line
+                )
+
+                target_role = (
+                    role_match.group(1).lower()
+                    if role_match else ""
+                )
+
+                if target_role in {"listitem", "treeitem", "hyperlink", "link"}:
+
+                    try:
+                        current_snapshot = wait_for_ui_stability(
+                            app_name,
+                            current_snapshot
+                        )
+
+                        valid_refs = set(
+                            re.findall(r"@e\d+", current_snapshot)
+                        )
+
+                        print(
+                            f"UI navigation completed and stabilized: {app_name}"
+                        )
+
+                    except RuntimeError as exc:
+                        raise RuntimeError(
+                            f"Navigation did not complete after step {index}: {exc}"
+                        )
+            # Refresh the UI after every click so newly opened editors are detected.
+            if action == "click":
+                try:
+                    current_snapshot = get_fresh_app_snapshot(app_name)
+                    valid_refs = set(
+                        re.findall(r"@e\d+", current_snapshot)
+                    )
+                except HTTPException as exc:
+                    raise RuntimeError(
+                        f"Could not refresh UI after click in step {index}: {exc.detail}"
+                    )
+            # Verify that Ctrl+N created a new blank Notepad tab.
+            if action == "key" and value == "ctrl+n":
+
+                def count_tabs(snapshot):
+                    return len(re.findall(
+                        r'^\s*\[@e\d+\]\s+tab\b',
+                        snapshot,
+                        re.MULTILINE
+                    ))
+
+                def get_active_editor_ref(snapshot):
+                    match = re.search(
+                        r'^\s*\[@(e\d+)\]\s+textarea\b',
+                        snapshot,
+                        re.MULTILINE
+                    )
+                    return match.group(1) if match else None
+
+                def get_character_count(snapshot):
+                    match = re.search(
+                        r'statictext "([\d,]+) characters" id=ContentTextBlock',
+                        snapshot
+                    )
+                    if not match:
+                        return None
+                    return int(match.group(1).replace(",", ""))
+
+                previous_tabs = re.findall(
+                    r'^\s*\[@e\d+\]\s+tab\s+.*$',
+                    current_snapshot,
+                    re.MULTILINE
+                )
+                new_snapshot = None
+
+                for attempt in range(10):
+                    try:
+                        candidate_snapshot = get_fresh_app_snapshot(app_name)
+                    except HTTPException as exc:
+                        raise RuntimeError(
+                            f"Could not verify the new Notepad tab: {exc.detail}"
+                        )
+
+                    candidate_tabs = re.findall(
+                        r'^\s*\[@e\d+\]\s+tab\s+.*$',
+                        candidate_snapshot,
+                        re.MULTILINE
+                    )
+
+                    if (
+                        candidate_tabs != previous_tabs
+                        and get_character_count(candidate_snapshot) == 0
+                    ):
+                        new_snapshot = candidate_snapshot
+                        break
+
+                    time.sleep(0.25)
+
+                if new_snapshot is None:
+                    raise RuntimeError(
+                        "Could not verify a newly created blank Notepad tab. "
+                        "Pasting was stopped to protect existing content."
+                    )
+
+                new_editor_ref = get_active_editor_ref(new_snapshot)
+
+                if not new_editor_ref:
+                    raise RuntimeError(
+                        "Could not identify the active Notepad editor. "
+                        "Pasting was stopped."
+                    )
+
+                focus_output = run_agent_cu(
+                    ["focus", f"@{new_editor_ref}", "--app", app_name],
+                    timeout=15
+                )
+
+                focus_result = json.loads(focus_output)
+
+                if not focus_result.get("success", False):
+                    raise RuntimeError(
+                        "Could not focus the new blank editor. Pasting was stopped."
+                    )
+
+                valid_refs = set(re.findall(r"@e\d+", new_snapshot))
+                current_snapshot = new_snapshot
+
+
+        except (HTTPException, RuntimeError) as exc:
+
+            error_message = (
+                str(exc.detail)
+                if isinstance(exc, HTTPException)
+                else str(exc)
+            )
+
+            return {
+                "success": False,
+                "failed_step": index,
+                "completed_steps": results,
+                "results": results + [{
+                    "step": index,
+                    "app": app_name,
+                    "action": action,
+                    "success": False,
+                    "error": error_message
+                }],
+                "execution_status": "stopped"
+            }
+
+    return {
+        "success": True,
+        "results": results,
+        "execution_status": "completed"
+    }

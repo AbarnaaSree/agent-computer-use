@@ -1,0 +1,638 @@
+
+import json
+import subprocess
+import re
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from typing import Literal
+
+# Load environment variables from backend/.env
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+app = FastAPI(
+    title="AI Desktop Automation",
+    description="OpenRouter-powered Windows desktop automation platform",
+    version="0.1.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+AGENT_CU = (
+    BASE_DIR.parent
+    / "cli"
+    / "target"
+    / "release"
+    / "agent-cu.exe"
+)
+
+
+def run_agent_cu(arguments: list[str], timeout: int = 15):
+    if not AGENT_CU.is_file():
+        raise HTTPException(
+            status_code=500,
+            detail="agent-cu executable not found. Build the Rust project first."
+        )
+
+    try:
+        result = subprocess.run(
+            [str(AGENT_CU), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=result.stderr.strip() or "Rust CLI execution failed"
+            )
+
+        return result.stdout
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="Rust automation command timed out"
+        )
+
+
+def get_openrouter_client():
+    api_key = os.getenv("OPENROUTER_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENROUTER_API_KEY is missing from backend/.env"
+        )
+
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        default_headers={
+            "HTTP-Referer": "http://localhost:5173",
+            "X-Title": "AI Desktop Automation"
+        }
+    )
+
+
+class PlanRequest(BaseModel):
+    task: str = Field(min_length=3, max_length=500)
+    app: str = Field(min_length=1, max_length=80)
+
+class ExecuteStep(BaseModel):
+    action: Literal["click", "type", "key", "wait"]
+    target_ref: str | None = None
+    value: str | None = None
+    reason: str | None = None
+
+
+class ExecuteRequest(BaseModel):
+    app: str = Field(min_length=1, max_length=80)
+    snapshot: str = Field(min_length=1)
+    steps: list[ExecuteStep] = Field(min_length=1, max_length=10)
+    confirmed: bool = False
+
+@app.get("/")
+async def root():
+    return {
+        "message": "AI Desktop Automation API",
+        "platform": "Windows",
+        "status": "running"
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "backend": "FastAPI"
+    }
+
+
+
+@app.get("/apps")
+async def get_running_apps():
+    output = run_agent_cu(["apps"], timeout=10)
+    windows_output = run_agent_cu(["windows"], timeout=10)
+
+    try:
+        applications = json.loads(output)
+        windows = json.loads(windows_output)
+
+        # Map packaged Windows application window titles.
+        app_names = {
+            item["name"]
+            for item in applications
+            if item.get("name")
+        }
+
+        for window in windows:
+            title = window.get("title", "").strip()
+            app_name = window.get("app", "").strip()
+
+            if title and app_name == "ApplicationFrameHost":
+                if title.lower() not in {"search bar", "windows input experience"}:
+                    app_names.add(title)
+
+        # Preserve existing app information.
+        result = []
+        for name in sorted(app_names, key=str.lower):
+            existing = next(
+                (item for item in applications if item.get("name") == name),
+                None
+            )
+
+            if existing:
+                result.append(existing)
+            else:
+                matching_window = next(
+                    (w for w in windows if w.get("title", "").strip() == name),
+                    {}
+                )
+                result.append({
+                    "name": name,
+                    "pid": matching_window.get("pid"),
+                    "frontmost": matching_window.get("frontmost", False)
+                })
+
+        return {
+            "success": True,
+            "count": len(result),
+            "applications": result
+        }
+
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=500,
+            detail="Invalid JSON received from Rust CLI"
+        )
+
+
+
+@app.get("/installed-apps")
+async def get_installed_apps():
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Depth 3"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=result.stderr.strip() or "Could not retrieve installed applications"
+            )
+
+        applications = json.loads(result.stdout)
+
+        # PowerShell returns an object instead of a list
+        # when only one application is found.
+        if isinstance(applications, dict):
+            applications = [applications]
+
+        applications = [
+            {
+                "name": item["Name"],
+                "app_id": item["AppID"]
+            }
+            for item in applications
+            if item.get("Name") and item.get("AppID")
+        ]
+
+        applications.sort(key=lambda item: item["name"].lower())
+
+        return {
+            "success": True,
+            "count": len(applications),
+            "applications": applications
+        }
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(
+            status_code=504,
+            detail="Installed application discovery timed out"
+        )
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not parse installed application data"
+        )
+
+
+@app.get("/snapshot")
+async def get_snapshot(
+    app_name: str = Query(..., alias="app", min_length=1, max_length=80)
+):
+    if not all(char.isalnum() or char in " ._-" for char in app_name):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid application name"
+        )
+
+    output = run_agent_cu(
+        ["snapshot", "--app", app_name, "-i", "-c"],
+        timeout=15
+    )
+
+    return {
+        "success": True,
+        "application": app_name,
+        "snapshot": output
+    }
+
+@app.post("/plan")
+async def create_plan(request: PlanRequest):
+    if not all(char.isalnum() or char in " ._-" for char in request.app):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid application name"
+        )
+
+    # Capture the current application UI.
+    snapshot_output = run_agent_cu(
+        ["snapshot", "--app", request.app, "-i", "-c"],
+        timeout=15
+    )
+
+    # Extract actual element references from the snapshot.
+    valid_refs = set(re.findall(r"@e\d+", snapshot_output))
+
+    if not valid_refs:
+        raise HTTPException(
+            status_code=422,
+            detail="No interactive UI element references found in the snapshot"
+        )
+
+    model = os.getenv(
+        "OPENROUTER_MODEL",
+        "google/gemini-2.5-flash"
+    )
+
+    try:
+        client = get_openrouter_client()
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+You are a Windows desktop automation planner.
+
+Analyze the user's task and the current UI snapshot.
+
+Return ONLY valid JSON using this exact structure:
+
+{
+  "task": "short task description",
+  "app": "application name",
+  "response": "helpful explanation for the user",
+  "steps": [
+    {
+      "action": "click",
+      "target_ref": "@e40",
+      "value": null,
+      "reason": "why this action is needed"
+    }
+  ],
+  "requires_confirmation": true
+}
+
+RULES:
+
+1. Use only exact element references visible in the supplied snapshot.
+2. Never invent or modify an element reference.
+3. Every click, type, and wait action MUST have a target_ref copied exactly from the snapshot.
+4. Every key action MUST have target_ref set to null.
+5. Allowed actions are ONLY: click, type, key, wait.
+6. Do not invent numbers, text, or values the user did not specify.
+7. If the user only asks to find, locate, identify, or explain a UI element,
+   provide the answer in "response" and return an empty steps array.
+8. Do not click an element merely to show where it is.
+9. If the requested task cannot be completed using the snapshot,
+   explain the limitation in "response" and return an empty steps array.
+10. Never generate shell commands or arbitrary code.
+11. Never execute actions. Only create a proposed plan.
+12. Keep the plan concise.
+13. Return ONLY valid JSON.
+14. Do not include explanations outside JSON.
+15. Keep the response field to one short sentence.
+16. Keep each step reason to 3-5 words.
+17. Do not repeat the UI snapshot in the response.
+18. Never include unnecessary fields.
+19. Always set "requires_confirmation" to true when the steps array contains one or more actions. Never set it to false for an action plan.
+"""
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Application: {request.app}\n"
+                        f"User task: {request.task}\n\n"
+                        f"Valid UI references: {sorted(valid_refs)}\n\n"
+                        f"Current UI snapshot:\n{snapshot_output}"
+                    )
+                }
+            ],
+            temperature=0.2,
+            max_tokens=2000,
+            response_format={"type": "json_object"}
+        )
+
+        content = response.choices[0].message.content
+        finish_reason = response.choices[0].finish_reason
+
+        if finish_reason == "length":
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"AI response truncated. "
+                    f"Requested model: {model}, "
+                    f"Actual model: {response.model}, "
+                    f"Finish reason: {finish_reason}, "
+                    f"Usage: {response.usage}"
+                )
+            )
+
+        if not content:
+            raise HTTPException(
+                status_code=502,
+                detail="OpenRouter returned an empty response"
+            )
+
+        cleaned = content.strip()
+
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3].strip()
+
+        plan = json.loads(cleaned)
+
+        if not isinstance(plan, dict):
+            raise ValueError("AI response must be a JSON object")
+
+        if not isinstance(plan.get("steps"), list):
+            raise ValueError("Plan steps must be a list")
+
+        if not isinstance(plan.get("response"), str):
+            raise ValueError("Plan response must be text")
+
+        if len(plan["steps"]) > 10:
+            raise ValueError("Plan contains too many steps")
+        
+        if plan["steps"]:
+            plan["requires_confirmation"] = True
+        else:
+            plan["requires_confirmation"] = False
+
+        allowed_actions = {"click", "type", "key", "wait"}
+        reference_required = {"click", "type", "wait"}
+
+        allowed_keys = {
+            "Return", "Enter", "Escape", "Tab",
+            "Backspace", "Delete", "Space",
+            "Up", "Down", "Left", "Right",
+            "Home", "End", "ctrl+a"
+        }
+
+        for index, step in enumerate(plan["steps"], start=1):
+            if not isinstance(step, dict):
+                raise ValueError(f"Step {index} must be a JSON object")
+
+            action = step.get("action")
+            target_ref = step.get("target_ref")
+            value = step.get("value")
+
+            if action not in allowed_actions:
+                raise ValueError(
+                    f"Unsupported action in step {index}: {action}"
+                )
+
+            if action in reference_required:
+                if not isinstance(target_ref, str) or target_ref not in valid_refs:
+                    raise ValueError(
+                        f"Step {index} ({action}) requires a valid UI reference. "
+                        f"Received: {target_ref}"
+                    )
+            elif target_ref is not None:
+                raise ValueError(
+                    f"Step {index}: key action must have target_ref set to null"
+                )
+
+            if action == "type":
+                if not isinstance(value, str) or not value or len(value) > 1000:
+                    raise ValueError(
+                        f"Step {index}: type action requires text between 1 and 1000 characters"
+                    )
+
+            elif action == "key":
+                if value not in allowed_keys:
+                    raise ValueError(
+                        f"Step {index}: unsupported or missing keyboard key"
+                    )
+
+            elif action in {"click", "wait"}:
+                if value is not None:
+                    raise ValueError(
+                        f"Step {index}: {action} action must have value set to null"
+                    )
+
+
+        plan["app"] = request.app
+
+        return {
+            "success": True,
+            "model": model,
+            "valid_ui_references": sorted(valid_refs),
+            "snapshot": snapshot_output,
+            "plan": plan,
+            "execution_status": "not_executed"
+        }
+
+    except HTTPException:
+        raise
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=502,
+            detail="AI returned invalid JSON"
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Invalid AI plan: {str(error)}"
+        )
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenRouter request failed: {str(error)}"
+        )
+
+
+@app.post("/execute")
+async def execute_plan(request: ExecuteRequest):
+    # Validate application name.
+    if not all(char.isalnum() or char in " ._-" for char in request.app):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid application name"
+        )
+
+    # Require explicit user approval.
+    if request.confirmed is not True:
+        raise HTTPException(
+            status_code=403,
+            detail="User confirmation is required before execution"
+        )
+
+    # Capture a fresh snapshot and reject stale plans.
+    fresh_snapshot = run_agent_cu(
+        ["snapshot", "--app", request.app, "-i", "-c"],
+        timeout=15
+    )
+
+    if fresh_snapshot != request.snapshot:
+        raise HTTPException(
+            status_code=409,
+            detail="The application UI has changed. Generate a new plan."
+        )
+
+    valid_refs = set(re.findall(r"@e\d+", fresh_snapshot))
+
+    # Conservative keyboard allowlist.
+    allowed_keys = {
+        "Return", "Enter", "Escape", "Tab",
+        "Backspace", "Delete", "Space",
+        "Up", "Down", "Left", "Right",
+        "Home", "End", "ctrl+a"
+    }
+
+    results = []
+
+    for index, step in enumerate(request.steps, start=1):
+        action = step.action
+        target_ref = step.target_ref
+        value = step.value
+
+        # Validate references.
+        if action in {"click", "type", "wait"}:
+            if target_ref not in valid_refs:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid UI reference in step {index}: {target_ref}"
+                )
+        elif target_ref is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Key action must not have a target reference (step {index})"
+            )
+
+        # Construct arguments without invoking a shell.
+        if action == "click":
+            if value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Click action cannot contain a value (step {index})"
+                )
+
+            arguments = [
+                "click", target_ref,
+                "--app", request.app
+            ]
+
+        elif action == "type":
+            if not isinstance(value, str) or not value or len(value) > 1000:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid text value in step {index}"
+                )
+
+            arguments = [
+                "type", value,
+                "--selector", target_ref,
+                "--app", request.app
+            ]
+
+        elif action == "key":
+            if value not in allowed_keys:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Keyboard key is not allowed in step {index}"
+                )
+
+            arguments = [
+                "key", value,
+                "--app", request.app
+            ]
+
+        elif action == "wait":
+            if value is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Wait action cannot contain a value (step {index})"
+                )
+
+            arguments = [
+                "wait-for", target_ref,
+                "--timeout", "5"
+            ]
+
+        try:
+            output = run_agent_cu(arguments, timeout=15)
+
+            try:
+                action_result = json.loads(output)
+            except json.JSONDecodeError:
+                action_result = {"output": output}
+
+            results.append({
+                "step": index,
+                "action": action,
+                "success": True,
+                "result": action_result
+            })
+
+        except HTTPException as error:
+            return {
+                "success": False,
+                "failed_step": index,
+                "completed_steps": results,
+                "detail": error.detail,
+                "execution_status": "stopped"
+            }
+
+    # Capture final application state.
+    final_snapshot = run_agent_cu(
+        ["snapshot", "--app", request.app, "-i", "-c"],
+        timeout=15
+    )
+
+    return {
+        "success": True,
+        "application": request.app,
+        "completed_steps": len(results),
+        "results": results,
+        "final_snapshot": final_snapshot,
+        "execution_status": "completed"
+    }
